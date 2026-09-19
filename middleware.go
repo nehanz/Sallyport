@@ -8,7 +8,6 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/nehanz/sallyport/internal/idempotency"
 	"github.com/nehanz/sallyport/internal/signature"
 )
 
@@ -16,7 +15,7 @@ type Config struct {
 	Secret      string
 	Secrets     []string
 	Tolerance   time.Duration
-	Idempotency idempotency.Store
+	Idempotency Store
 	ClaimTTL    time.Duration
 }
 
@@ -45,7 +44,7 @@ func New(cfg Config, next http.Handler) http.Handler {
 		cfg.ClaimTTL = 24 * time.Hour
 	}
 	if cfg.Idempotency == nil {
-		panic("sallyport: Idempotency store is required")
+		cfg.Idempotency = NewMemoryStore()
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {

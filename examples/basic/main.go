@@ -6,7 +6,6 @@ import (
 	"os"
 
 	"github.com/nehanz/sallyport"
-	"github.com/nehanz/sallyport/internal/idempotency"
 )
 
 func main() {
@@ -15,7 +14,7 @@ func main() {
 		log.Fatal("WEBHOOK_SECRET environment variable is required")
 	}
 
-	store := idempotency.NewMemoryStore()
+	store := sallyport.NewMemoryStore()
 
 	appHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		log.Println("Webhook processed successfully!")

@@ -1,23 +1,27 @@
 # Sallyport
 
-Sallyport is a secure, production-ready Go HTTP middleware for validating webhook signatures. It implements the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks) specification to protect your API endpoints from unauthorized access and replay attacks.
+Sallyport is a secure, lightweight Go HTTP middleware for webhook verification and replay protection following the [Standard Webhooks](https://github.com/standard-webhooks/standard-webhooks) specification.
 
-## What It Protects Against
+## Features
 
-1. **Forgery Attacks**: Ensures the request was actually sent by the trusted party who holds the shared secret key, not a malicious actor.
-2. **Replay Attacks**: Uses a timestamp and message ID included in the signature to ensure that intercepted payloads cannot be re-sent later. 
-3. **Timing Attacks**: Uses constant-time string comparison (`hmac.Equal`) to prevent attackers from guessing the signature character-by-character based on response times.
+- **Signature Verification**: Validates HMAC-SHA256 signatures with constant-time equality checks.
+- **Timestamp Freshness**: Rejects expired or future-dated webhook deliveries.
+- **Idempotency & Deduplication**: Ensures each webhook is processed once (in-memory or persistent SQLite).
+- **Auto-Retry Support**: Automatically releases claims on 5xx server errors so providers can retry.
+- **Zero-Downtime Secret Rotation**: Supports multiple active secrets and multi-signature headers.
+- **SSRF Protection**: Provides safe HTTP clients that block loopback, internal subnets, and cloud metadata endpoints.
 
-## How it Works
+---
 
-The middleware expects the following headers to be present in incoming webhook requests:
-- `webhook-id`: A unique identifier for the message.
-- `webhook-timestamp`: The Unix timestamp when the request was signed.
-- `webhook-signature`: A base64-encoded HMAC-SHA256 hash.
+## Installation
 
-It constructs a signed string in the format `msg_id.timestamp.raw_body` and hashes it using your configured secret. If the hashes match and the timestamp is within the allowed tolerance window (default 5 minutes), the request is passed to your application.
+```bash
+go get github.com/nehanz/sallyport
+```
 
-## Usage
+---
+
+## Quickstart
 
 ```go
 package main
@@ -30,17 +34,78 @@ import (
 	"github.com/nehanz/sallyport"
 )
 
-func main() {
-	secret := os.Getenv("WEBHOOK_SECRET")
-	
-	appHandler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		log.Println("Webhook processed successfully!")
-		w.WriteHeader(http.StatusOK)
-	})
+func webhookHandler(w http.ResponseWriter, r *http.Request) {
+	w.WriteHeader(http.StatusOK)
+	w.Write([]byte(`{"status":"received"}`))
+}
 
-    // Wrap your handler with the sallyport middleware
-	http.Handle("/webhook", sallyport.New(sallyport.Config{Secret: secret}, appHandler))
-	
+func main() {
+	middleware := sallyport.New(sallyport.Config{
+		Secret: os.Getenv("WEBHOOK_SECRET"),
+	}, http.HandlerFunc(webhookHandler))
+
+	http.Handle("/webhooks", middleware)
 	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 ```
+
+---
+
+## Common Use Cases
+
+### 1. Persistent Storage (SQLite)
+
+Persist processed message IDs across server restarts:
+
+```go
+store, err := sallyport.NewSQLiteStore("./webhooks.db")
+if err != nil {
+	log.Fatal(err)
+}
+
+middleware := sallyport.New(sallyport.Config{
+	Secret:      os.Getenv("WEBHOOK_SECRET"),
+	Idempotency: store,
+}, appHandler)
+```
+
+### 2. Secret Rotation
+
+Rotate webhook signing secrets without downtime:
+
+```go
+middleware := sallyport.New(sallyport.Config{
+	Secrets: []string{
+		os.Getenv("NEW_WEBHOOK_SECRET"),
+		os.Getenv("OLD_WEBHOOK_SECRET"),
+	},
+}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// Check which secret was matched
+	matchedSecret := sallyport.MatchedSecret(r.Context())
+	log.Printf("Verified with: %s", matchedSecret)
+	w.WriteHeader(http.StatusOK)
+}))
+```
+
+### 3. SSRF-Safe Outbound Client
+
+If your application dispatches webhooks or calls external callback URLs:
+
+```go
+client := sallyport.NewSafeClient(10 * time.Second)
+
+// Blocks 127.0.0.1, private IPs (10.x, 192.168.x), and cloud metadata (169.254.169.254)
+resp, err := client.Get("https://example.com/webhook")
+```
+
+---
+
+## Configuration Reference
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `Secret` | `string` | `""` | Single active signing secret. |
+| `Secrets` | `[]string` | `nil` | Multiple secrets for rotation (takes precedence). |
+| `Tolerance` | `time.Duration` | `5m` | Maximum allowed timestamp drift. |
+| `Idempotency` | `sallyport.Store` | `MemoryStore` | Store backend (`NewMemoryStore` or `NewSQLiteStore`). |
+| `ClaimTTL` | `time.Duration` | `24h` | Time to remember processed message IDs. |

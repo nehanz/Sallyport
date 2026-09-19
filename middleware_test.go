@@ -402,3 +402,36 @@ func TestSQLiteMiddlewareIntegration(t *testing.T) {
 	}
 }
 
+func TestDefaultIdempotencyStore(t *testing.T) {
+	handler := New(Config{
+		Secret: testSecret,
+	}, okHandler())
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	resp, err := sender.SignAndSend(srv.URL, testSecret, []byte(`{"test":"default"}`))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Errorf("got status %d, want 200", resp.StatusCode)
+	}
+}
+
+func TestPublicStoreConstructors(t *testing.T) {
+	memStore := NewMemoryStore()
+	if memStore == nil {
+		t.Fatal("expected non-nil memory store")
+	}
+
+	tmpDir := t.TempDir()
+	sqlStore, err := NewSQLiteStore(filepath.Join(tmpDir, "public_test.db"))
+	if err != nil || sqlStore == nil {
+		t.Fatalf("expected non-nil sqlite store, got err: %v", err)
+	}
+	sqlStore.Close()
+}
+
+
