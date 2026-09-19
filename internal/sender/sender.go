@@ -52,6 +52,17 @@ func SignAndSend(url, secret string, payload []byte) (*http.Response, error) {
 	return http.DefaultClient.Do(req)
 }
 
+func SignAndSendWithClient(client *http.Client, url, secret string, payload []byte) (*http.Response, error) {
+	if client == nil {
+		client = http.DefaultClient
+	}
+	req, err := NewRequest(url, secret, payload)
+	if err != nil {
+		return nil, err
+	}
+	return client.Do(req)
+}
+
 func SignAndSendTampered(url, secret string, payload []byte) (*http.Response, error) {
 	msgID := "msg_" + randomHex(16)
 	ts := strconv.FormatInt(time.Now().Unix(), 10)

@@ -2,6 +2,7 @@ package sallyport
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"strconv"
@@ -17,6 +18,17 @@ type Config struct {
 	Tolerance   time.Duration
 	Idempotency idempotency.Store
 	ClaimTTL    time.Duration
+}
+
+type contextKey int
+
+const matchedSecretKey contextKey = 1
+
+func MatchedSecret(ctx context.Context) string {
+	if v, ok := ctx.Value(matchedSecretKey).(string); ok {
+		return v
+	}
+	return ""
 }
 
 func New(cfg Config, next http.Handler) http.Handler {
@@ -65,18 +77,16 @@ func New(cfg Config, next http.Handler) http.Handler {
 			return
 		}
 
-		if err := signature.Verify(body, cfg.Secrets[0], msgID, tsStr, sigHeader); err != nil {
-			verified := false
-			for _, s := range cfg.Secrets[1:] {
-				if signature.Verify(body, s, msgID, tsStr, sigHeader) == nil {
-					verified = true
-					break
-				}
+		var matched string
+		for _, s := range cfg.Secrets {
+			if signature.Verify(body, s, msgID, tsStr, sigHeader) == nil {
+				matched = s
+				break
 			}
-			if !verified {
-				http.Error(w, "invalid signature", http.StatusUnauthorized)
-				return
-			}
+		}
+		if matched == "" {
+			http.Error(w, "invalid signature", http.StatusUnauthorized)
+			return
 		}
 
 		claimed, err := cfg.Idempotency.Claim(r.Context(), msgID, cfg.ClaimTTL)
@@ -88,6 +98,8 @@ func New(cfg Config, next http.Handler) http.Handler {
 			w.WriteHeader(http.StatusOK)
 			return
 		}
+
+		r = r.WithContext(context.WithValue(r.Context(), matchedSecretKey, matched))
 
 		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
 		next.ServeHTTP(rec, r)
