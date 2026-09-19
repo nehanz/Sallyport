@@ -28,7 +28,7 @@ func Handler(secret string) http.Handler {
         mac.Write(body)
         expected := hex.EncodeToString(mac.Sum(nil))
 
-        if sig == expected {
+        if hmac.Equal([]byte(sig), []byte(expected)) {
             log.Println("ACCEPTED: signature valid")
             w.WriteHeader(http.StatusOK)
             return
