@@ -40,6 +40,10 @@ func NewRequest(url, secret string, payload []byte) (*http.Request, error) {
 	return req, nil
 }
 
+func SignRequest(url, secret string, payload []byte) (*http.Request, error) {
+	return NewRequest(url, secret, payload)
+}
+
 func SignAndSend(url, secret string, payload []byte) (*http.Response, error) {
 	req, err := NewRequest(url, secret, payload)
 	if err != nil {

@@ -2,13 +2,16 @@ package sallyport
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
 
+	"github.com/nehanz/sallyport/internal/idempotency"
 	"github.com/nehanz/sallyport/internal/sender"
 )
 
@@ -20,8 +23,13 @@ func okHandler() http.Handler {
 	})
 }
 
+func newTestMiddleware(store idempotency.Store) http.Handler {
+	return New(Config{Secret: testSecret, Idempotency: store}, okHandler())
+}
+
+
 func TestMiddleware(t *testing.T) {
-	srv := httptest.NewServer(New(Config{Secret: testSecret}, okHandler()))
+	srv := httptest.NewServer(newTestMiddleware(idempotency.NewMemoryStore()))
 	defer srv.Close()
 
 	payload := []byte(`{"event":"test"}`)
@@ -43,7 +51,7 @@ func TestMiddleware(t *testing.T) {
 			r.Header.Set("webhook-timestamp", "1000000000") // year 2001
 		}, false, http.StatusUnauthorized},
 		{"future timestamp", func(r *http.Request) {
-			r.Header.Set("webhook-timestamp", "9999999999") // future
+			r.Header.Set("webhook-timestamp", "9999999999")
 		}, false, http.StatusUnauthorized},
 		{"tampered body", func(r *http.Request) {}, true, http.StatusUnauthorized},
 		{"wrong signature prefix", func(r *http.Request) {
@@ -59,9 +67,9 @@ func TestMiddleware(t *testing.T) {
 			if tc.tamperBody {
 				resp, err = sender.SignAndSendTampered(srv.URL, testSecret, payload)
 			} else {
-				req, errReq := sender.NewRequest(srv.URL, testSecret, payload)
-				if errReq != nil {
-					t.Fatalf("failed to create request: %v", errReq)
+				req, reqErr := sender.NewRequest(srv.URL, testSecret, payload)
+				if reqErr != nil {
+					t.Fatalf("failed to create request: %v", reqErr)
 				}
 				tc.mutate(req)
 				resp, err = http.DefaultClient.Do(req)
@@ -79,13 +87,15 @@ func TestMiddleware(t *testing.T) {
 	}
 }
 
+
 func TestBodyRestored(t *testing.T) {
 	payload := []byte(`{"event":"test"}`)
 	var seen []byte
 
-	handler := New(Config{Secret: testSecret}, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seen, _ = io.ReadAll(r.Body)
-	}))
+	handler := New(Config{Secret: testSecret, Idempotency: idempotency.NewMemoryStore()},
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			seen, _ = io.ReadAll(r.Body)
+		}))
 
 	srv := httptest.NewServer(handler)
 	defer srv.Close()
@@ -101,8 +111,9 @@ func TestBodyRestored(t *testing.T) {
 	}
 }
 
+
 func TestConcurrentRequests(t *testing.T) {
-	srv := httptest.NewServer(New(Config{Secret: testSecret}, okHandler()))
+	srv := httptest.NewServer(newTestMiddleware(idempotency.NewMemoryStore()))
 	defer srv.Close()
 
 	var wg sync.WaitGroup
@@ -117,6 +128,125 @@ func TestConcurrentRequests(t *testing.T) {
 		}()
 	}
 	wg.Wait()
+}
+
+func TestIdempotency(t *testing.T) {
+	store := idempotency.NewMemoryStore()
+	var handled atomic.Int32
+
+	handler := New(Config{Secret: testSecret, Idempotency: store},
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handled.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	payload := []byte(`{"event":"payment.succeeded"}`)
+	req, err := sender.SignRequest(srv.URL, testSecret, payload)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	for i := 0; i < 2; i++ {
+		r := req.Clone(context.Background())
+		r.Body = io.NopCloser(bytes.NewReader(payload))
+		resp, err := http.DefaultClient.Do(r)
+		if err != nil {
+			t.Fatalf("send %d failed: %v", i, err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			t.Errorf("send %d: got status %d, want 200", i, resp.StatusCode)
+		}
+	}
+
+	if got := handled.Load(); got != 1 {
+		t.Errorf("handler called %d times, want 1", got)
+	}
+}
+
+func TestClaimReleasedOn5xx(t *testing.T) {
+	store := idempotency.NewMemoryStore()
+	var calls atomic.Int32
+
+	handler := New(Config{Secret: testSecret, Idempotency: store},
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if calls.Add(1) == 1 {
+				http.Error(w, "temporary error", http.StatusInternalServerError)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+		}))
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	payload := []byte(`{"event":"payment.succeeded"}`)
+	req, err := sender.SignRequest(srv.URL, testSecret, payload)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	r1 := req.Clone(context.Background())
+	r1.Body = io.NopCloser(bytes.NewReader(payload))
+	resp1, _ := http.DefaultClient.Do(r1)
+	resp1.Body.Close()
+	if resp1.StatusCode != http.StatusInternalServerError {
+		t.Errorf("first send: got %d, want 500", resp1.StatusCode)
+	}
+
+	r2 := req.Clone(context.Background())
+	r2.Body = io.NopCloser(bytes.NewReader(payload))
+	resp2, _ := http.DefaultClient.Do(r2)
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusOK {
+		t.Errorf("second send: got %d, want 200", resp2.StatusCode)
+	}
+
+	if got := calls.Load(); got != 2 {
+		t.Errorf("handler called %d times, want 2", got)
+	}
+}
+
+func TestConcurrentDuplicates(t *testing.T) {
+	store := idempotency.NewMemoryStore()
+	var handled atomic.Int32
+
+	handler := New(Config{Secret: testSecret, Idempotency: store},
+		http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			handled.Add(1)
+			w.WriteHeader(http.StatusOK)
+		}))
+
+	srv := httptest.NewServer(handler)
+	defer srv.Close()
+
+	payload := []byte(`{}`)
+	req, err := sender.SignRequest(srv.URL, testSecret, payload)
+	if err != nil {
+		t.Fatalf("failed to create request: %v", err)
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 100; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := req.Clone(context.Background())
+			r.Body = io.NopCloser(bytes.NewReader(payload))
+			resp, err := http.DefaultClient.Do(r)
+			if err == nil {
+				resp.Body.Close()
+			}
+		}()
+	}
+	wg.Wait()
+
+	if got := handled.Load(); got != 1 {
+		t.Errorf("handler called %d times, want exactly 1", got)
+	}
 }
 
 func FuzzTimestamp(f *testing.F) {

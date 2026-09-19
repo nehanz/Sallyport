@@ -7,17 +7,33 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/nehanz/sallyport/internal/idempotency"
 	"github.com/nehanz/sallyport/internal/signature"
 )
 
 type Config struct {
-	Secret    string
-	Tolerance time.Duration
+	Secret      string
+	Secrets     []string
+	Tolerance   time.Duration
+	Idempotency idempotency.Store
+	ClaimTTL    time.Duration
 }
 
 func New(cfg Config, next http.Handler) http.Handler {
+	if len(cfg.Secrets) == 0 && cfg.Secret != "" {
+		cfg.Secrets = []string{cfg.Secret}
+	}
+	if len(cfg.Secrets) == 0 {
+		panic("sallyport: at least one secret is required")
+	}
 	if cfg.Tolerance == 0 {
 		cfg.Tolerance = 5 * time.Minute
+	}
+	if cfg.ClaimTTL == 0 {
+		cfg.ClaimTTL = 24 * time.Hour
+	}
+	if cfg.Idempotency == nil {
+		panic("sallyport: Idempotency store is required")
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -43,18 +59,51 @@ func New(cfg Config, next http.Handler) http.Handler {
 			http.Error(w, "invalid timestamp", http.StatusUnauthorized)
 			return
 		}
-
 		age := time.Since(time.Unix(ts, 0))
 		if age > cfg.Tolerance || age < -cfg.Tolerance {
 			http.Error(w, "timestamp outside tolerance", http.StatusUnauthorized)
 			return
 		}
 
-		if err := signature.Verify(body, cfg.Secret, msgID, tsStr, sigHeader); err != nil {
-			http.Error(w, "invalid signature", http.StatusUnauthorized)
+		if err := signature.Verify(body, cfg.Secrets[0], msgID, tsStr, sigHeader); err != nil {
+			verified := false
+			for _, s := range cfg.Secrets[1:] {
+				if signature.Verify(body, s, msgID, tsStr, sigHeader) == nil {
+					verified = true
+					break
+				}
+			}
+			if !verified {
+				http.Error(w, "invalid signature", http.StatusUnauthorized)
+				return
+			}
+		}
+
+		claimed, err := cfg.Idempotency.Claim(r.Context(), msgID, cfg.ClaimTTL)
+		if err != nil {
+			http.Error(w, "idempotency error", http.StatusInternalServerError)
+			return
+		}
+		if !claimed {
+			w.WriteHeader(http.StatusOK)
 			return
 		}
 
-		next.ServeHTTP(w, r)
+		rec := &statusRecorder{ResponseWriter: w, status: http.StatusOK}
+		next.ServeHTTP(rec, r)
+
+		if rec.status >= 500 {
+			cfg.Idempotency.Release(r.Context(), msgID)
+		}
 	})
+}
+
+type statusRecorder struct {
+	http.ResponseWriter
+	status int
+}
+
+func (s *statusRecorder) WriteHeader(code int) {
+	s.status = code
+	s.ResponseWriter.WriteHeader(code)
 }
